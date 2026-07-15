@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Cloud-Native Campus Incident Response and Safety Analytics Platform.
+  Serverless backend: Cognito auth, API Gateway, Lambda, DynamoDB, S3, SNS,
+  CloudWatch monitoring and a regional WAF in front of the API.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  AlertEmail:
+    Type: String
+    Description: Email address subscribed to the incident alerts SNS topic (for demo purposes).
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: CORS origin allowed to call the API (set to your CloudFront/S3 site URL in production).
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 10
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        INCIDENTS_TABLE: !Ref IncidentsTable
+        STATUS_INDEX_NAME: StatusCreatedAtIndex
+        ALL_ITEMS_INDEX_NAME: AllItemsCreatedAtIndex
+        REPORTER_INDEX_NAME: ReporterCreatedAtIndex
+        EVIDENCE_BUCKET: !Ref EvidenceBucket
+        ALERTS_TOPIC_ARN: !Ref AlertsTopic
+        ALLOWED_ORIGIN: !Ref AllowedOrigin
+  Api:
+    Cors:
+      AllowOrigin: !Sub "'${AllowedOrigin}'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowMethods: "'OPTIONS,GET,POST,PATCH'"
+
+Resources:
+  ######################################################################
+  # Data layer
+  ######################################################################
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub incidents-${Stage}
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: incidentId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: reportedBy
+          AttributeType: S
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: incidentId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: StatusCreatedAtIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ReporterCreatedAtIndex
+          KeySchema:
+            - AttributeName: reportedBy
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: AllItemsCreatedAtIndex
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub incident-evidence-${Stage}-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [PUT, GET]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionOldEvidenceToInfrequentAccess
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+
+  ######################################################################
+  # Identity: Cognito User Pool with Admin/Security/Reporter groups
+  ######################################################################
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub incident-platform-users-${Stage}
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      MfaConfiguration: 'OFF'
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: true
+          Mutable: true
+      LambdaConfig:
+        PostConfirmation: !GetAtt PostConfirmationFunction.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub incident-platform-web-${Stage}
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Admin
+      UserPoolId: !Ref UserPool
+      Description: Full administrative access to the platform.
+      Precedence: 0
+
+  SecurityGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Security
+      UserPoolId: !Ref UserPool
+      Description: Campus security/responder staff who triage and resolve incidents.
+      Precedence: 1
+
+  ReporterGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Reporter
+      UserPoolId: !Ref UserPool
+      Description: Default group for students/staff who report incidents.
+      Precedence: 2
+
+  PostConfirmationInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PostConfirmationFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  ######################################################################
+  # Notifications
+  ######################################################################
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub incident-alerts-${Stage}
+      KmsMasterKeyId: alias/aws/sns
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  ######################################################################
+  # API Gateway (REST API, Cognito-authorized) + WAF
+  ######################################################################
+  IncidentApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub incident-api-${Stage}
+      StageName: !Ref Stage
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          LoggingLevel: INFO
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  ApiWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub incident-api-waf-${Stage}
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub incident-api-waf-${Stage}
+      Rules:
+        - Name: AWS-AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+        - Name: RateLimitPerIp
+          Priority: 1
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIp
+
+  ApiWebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Sub arn:aws:apigateway:${AWS::Region}::/restapis/${IncidentApi}/stages/${Stage}
+      WebACLArn: !GetAtt ApiWebAcl.Arn
+
+  ######################################################################
+  # Lambda functions
+  ######################################################################
+  CreateIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/createIncident.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        CreateIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref IncidentApi
+            Path: /incidents
+            Method: POST
+
+  ListIncidentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/listIncidents.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        ListIncidents:
+          Type: Api
+          Properties:
+            RestApiId: !Ref IncidentApi
+            Path: /incidents
+            Method: GET
+
+  GetIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/getIncident.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        GetIncident:
+          Type: Api
+          Properties:
+            RestApiId: !Ref IncidentApi
+            Path: /incidents/{id}
+            Method: GET
+
+  UpdateIncidentStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/updateIncidentStatus.handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        UpdateIncidentStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref IncidentApi
+            Path: /incidents/{id}/status
+            Method: PATCH
+
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/getUploadUrl.handler
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref EvidenceBucket
+      Events:
+        GetUploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref IncidentApi
+            Path: /uploads/presign
+            Method: POST
+
+  AnalyticsSummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/analyticsSummary.handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref IncidentsTable
+      Events:
+        AnalyticsSummary:
+          Type: Api
+          Properties:
+            RestApiId: !Ref IncidentApi
+            Path: /analytics/summary
+            Method: GET
+
+  NotifyRespondersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/notifyResponders.handler
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertsTopic.TopicName
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:ListStreams
+              Resource: !GetAtt IncidentsTable.StreamArn
+      Events:
+        IncidentStream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt IncidentsTable.StreamArn
+            StartingPosition: LATEST
+            BatchSize: 10
+            MaximumRetryAttempts: 3
+
+  PostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: src/functions/postConfirmationTrigger.handler
+      Environment:
+        Variables:
+          DEFAULT_USER_GROUP: Reporter
+      Policies:
+        # NOTE: cannot scope this to the specific UserPool ARN because that
+        # would create a circular dependency (UserPool.LambdaConfig ->
+        # this function, this function's role -> UserPool.Arn). Scoped to
+        # this account/region instead.
+        - Statement:
+            - Effect: Allow
+              Action: cognito-idp:AdminAddUserToGroup
+              Resource: !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*
+
+  ######################################################################
+  # Monitoring / CloudWatch alarms
+  ######################################################################
+  CreateIncidentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub create-incident-errors-${Stage}
+      AlarmDescription: Alerts when the createIncident Lambda starts failing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateIncidentFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  NotifyRespondersErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub notify-responders-errors-${Stage}
+      AlarmDescription: Alerts when the alert-notification pipeline is failing.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NotifyRespondersFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  DynamoThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub incidents-table-throttles-${Stage}
+      AlarmDescription: Alerts when the Incidents table is being throttled.
+      Namespace: AWS/DynamoDB
+      MetricName: ThrottledRequests
+      Dimensions:
+        - Name: TableName
+          Value: !Ref IncidentsTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the incident API
+    Value: !Sub https://${IncidentApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  EvidenceBucketName:
+    Value: !Ref EvidenceBucket
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic

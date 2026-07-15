@@ -1,0 +1,10 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "campus-incident-platform"
+resolve_s3 = true
+s3_prefix = "campus-incident-platform"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+parameter_overrides = "Stage=\"dev\" AlertEmail=\"security-team@example.edu\" AllowedOrigin=\"*\""
