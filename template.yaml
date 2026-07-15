@@ -127,6 +127,8 @@ Resources:
   # Identity: Cognito User Pool with Admin/Security/Reporter groups
   ######################################################################
   UserPool:
+    DependsOn:
+      - PostConfirmationInvokePermission
     Type: AWS::Cognito::UserPool
     Properties:
       UserPoolName: !Sub incident-platform-users-${Stage}
@@ -198,7 +200,7 @@ Resources:
       Action: lambda:InvokeFunction
       FunctionName: !Ref PostConfirmationFunction
       Principal: cognito-idp.amazonaws.com
-      SourceArn: !GetAtt UserPool.Arn
+      SourceAccount: !Ref AWS::AccountId
 
   ######################################################################
   # Notifications
